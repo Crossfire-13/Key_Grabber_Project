@@ -1,0 +1,225 @@
+#include <SoftwareSerial.h> // For SSC-32U communication
+
+// Joystick pins
+const int left_x_pin = A1;  // Joystick 1 X-axis
+const int left_y_pin = A0;  // Joystick 1 Y-axis
+const int right_x_pin = A3; // Joystick 2 X-axis
+const int right_y_pin = A2; // Joystick 2 Y-axis
+
+// Joystick SW pins for gripper control
+const int sw_left_pin = 5;  // Joystick 1 SW pin (open gripper)
+const int sw_right_pin = 4; // Joystick 2 SW pin (close gripper)
+
+// Playback button
+const int play_button = 7; // Button to start playback
+
+// Emergency stop button
+const int emergency_stop_pin = 6; // Button for emergency stop
+
+// LED status pin
+const int ledPin = 13; // LED indicator pin
+
+// Initialize SoftwareSerial for SSC-32U communication
+SoftwareSerial sscSerial(10, 11); // RX, TX pins for SSC-32U
+
+// Motor locations (current pulse widths for servos)
+int motor_locs[6] = {1500, 1500, 1500, 1500, 1500, 1500}; // Initial pulse widths
+
+// Joystick base positions
+int left_base_x, left_base_y;
+int right_base_x, right_base_y;
+
+// Teach and repeat storage
+const int maxPositions = 100; // Maximum number of recorded positions
+int recordedPositions[maxPositions][6]; // Store pulse widths for all servos
+int positionCount = 0; // Number of recorded positions
+bool isEmergencyStop = false; // Emergency stop flag
+
+// Function prototypes
+void controlWithJoystickAndRecord();
+void sendServoCommands(int pulseBase, int pulseShoulder, int pulseElbow, int pulseWristRotate, int pulseGripper, int transitionTime);
+void playBackPositions();
+void updateLEDStatus(bool isMoving);
+int calculateWristParallel(int pulseShoulder, int pulseElbow);
+void checkEmergencyStop();
+
+void setup() {
+    Serial.begin(115200);      // Serial Monitor for debugging
+    sscSerial.begin(115200);   // SSC-32U communication at default baud rate
+
+    // Pin configurations
+    pinMode(sw_left_pin, INPUT_PULLUP);  // SW pin for opening gripper
+    pinMode(sw_right_pin, INPUT_PULLUP); // SW pin for closing gripper
+    pinMode(play_button, INPUT_PULLUP);  // Playback button
+    pinMode(ledPin, OUTPUT); // LED status pin
+    digitalWrite(ledPin, LOW); // Ensure LED is OFF at startup
+
+    // Calibrate joystick centers
+    left_base_x = analogRead(left_x_pin);
+    left_base_y = analogRead(left_y_pin);
+    right_base_x = analogRead(right_x_pin);
+    right_base_y = analogRead(right_y_pin);
+
+    // Center servos initially
+    motor_locs[0] = 1500; // Servo 0 (base)
+    motor_locs[1] = 1500; // Servo 1 (shoulder)
+    motor_locs[2] = 1500; // Servo 2 (elbow)
+    motor_locs[3] = 1500; // Servo 3 (wrist rotation)
+    motor_locs[5] = 1500; // Servo 5 (gripper)
+
+    sendServoCommands(motor_locs[0], motor_locs[1], motor_locs[2], motor_locs[3], motor_locs[5], 1000); // Initial position
+    delay(2000); // Allow servos to settle
+}
+
+void loop() {
+    
+
+    // Repeat mode: Play back recorded positions
+    if (digitalRead(play_button) == LOW) {
+        playBackPositions();
+        delay(500); // Debounce
+    }
+
+    // Regular joystick control and record movements
+    controlWithJoystickAndRecord();
+
+    // Check emergency stop status
+    checkEmergencyStop();
+    if (isEmergencyStop) return; // Halt everything if emergency stop is active
+}
+
+void controlWithJoystickAndRecord() {
+    // Read joystick values
+    int j1X = analogRead(left_x_pin);  // Base control (X-axis)
+    int j1Y = analogRead(left_y_pin);  // Shoulder control (Y-axis)
+    int j2X = analogRead(right_x_pin); // Elbow control (X-axis)
+    int j2Y = analogRead(right_y_pin); // Wrist control (Y-axis)
+
+    // Apply dead zone to avoid small movements when the joystick is centered
+    const int deadzone = 100;  // Deadzone threshold for joystick
+
+    // Adjust servo positions based on joystick input
+    if (abs(j1X - left_base_x) > deadzone) {
+        motor_locs[0] = constrain(motor_locs[0] + (j1X > left_base_x ? 5 : -5), 500, 2500);
+    }
+    if (abs(j1Y - left_base_y) > deadzone) {
+        motor_locs[1] = constrain(motor_locs[1] + (j1Y > left_base_y ? 5 : -5), 500, 2500);
+    }
+    if (abs(j2X - right_base_x) > deadzone) {
+        motor_locs[2] = constrain(motor_locs[2] + (j2X > right_base_x ? 5 : -5), 500, 2500);
+    }
+
+    // Dynamically calculate Servo 4 (wrist rotation) to keep parallel to the ground
+    motor_locs[3] = calculateWristParallel(motor_locs[1], motor_locs[2]);
+
+    // Gripper control using joystick SW pins
+    if (digitalRead(sw_left_pin) == LOW) {
+        motor_locs[5] = constrain(motor_locs[5] + 40, 500, 2500);  // Open gripper
+        Serial.println("Gripper Open");
+        delay(100);  // Debounce delay
+    }
+    if (digitalRead(sw_right_pin) == LOW) {
+        motor_locs[5] = constrain(motor_locs[5] - 40, 500, 2500);  // Close gripper
+        Serial.println("Gripper Close");
+        delay(100);  // Debounce delay
+    }
+
+    // Send updated servo positions to SSC-32U
+    sendServoCommands(motor_locs[0], motor_locs[1], motor_locs[2], motor_locs[3], motor_locs[5], 100);
+    delay(15); // Stability delay
+
+    // Record current position if it has changed significantly
+    static int lastRecordedPosition[6] = {1500, 1500, 1500, 1500, 1500, 1500};
+    bool significantChange = false;
+
+    for (int i = 0; i < 6; i++) {
+        if (abs(motor_locs[i] - lastRecordedPosition[i]) > 10) { // Threshold for significant change
+            significantChange = true;
+            break;
+        }
+    }
+
+    if (significantChange && positionCount < maxPositions) {
+        for (int i = 0; i < 6; i++) {
+            recordedPositions[positionCount][i] = motor_locs[i];
+            lastRecordedPosition[i] = motor_locs[i];
+        }
+        positionCount++;
+        Serial.print("Recorded Position: ");
+        for (int i = 0; i < 6; i++) {
+            Serial.print(motor_locs[i]);
+            Serial.print(" ");
+        }
+        Serial.println();
+    }
+   
+}
+
+void playBackPositions() {
+    for (int i = 0; i < positionCount; i++) {
+        // Replay each recorded position
+        sendServoCommands(
+            recordedPositions[i][0], 
+            recordedPositions[i][1], 
+            recordedPositions[i][2], 
+            recordedPositions[i][3], 
+            recordedPositions[i][5], 
+            1000
+        );
+
+        delay(1000); // Wait before moving to the next position
+        updateLEDStatus(true); // Keep LED ON during playback
+    }
+    updateLEDStatus(false); // Turn LED OFF after playback
+    Serial.println("Playback completed!");
+}
+
+// Function to calculate Servo 4 pulse width for parallelism
+int calculateWristParallel(int pulseShoulder, int pulseElbow) {
+    // Convert pulse widths to angles
+    double theta2 = (pulseShoulder - 1500) / 11.1; // Shoulder angle in degrees
+    double theta3 = (pulseElbow - 1500) / 11.1;    // Elbow angle in degrees
+
+    // Calculate wrist rotation angle (theta4) for parallelism
+    double theta4 = -(theta2 + theta3); // Wrist angle in degrees
+
+    // Convert angle back to pulse width
+    int pulseWristRotate = 1500 + theta4 * 11.1;
+
+    // Clamp the pulse width to valid servo range (500–2500 µs)
+    pulseWristRotate = constrain(pulseWristRotate, 500, 2500);
+
+    return pulseWristRotate;
+}
+
+// Function to send servo commands to SSC-32U
+void sendServoCommands(int pulseBase, int pulseShoulder, int pulseElbow, int pulseWristRotate, int pulseGripper, int transitionTime) {
+    char command[100];
+
+    // Format the command string
+    sprintf(command, "#0P%d #1P%d #2P%d #3P%d #5P%d T%d\r", pulseBase, pulseShoulder, pulseElbow, pulseWristRotate, pulseGripper, transitionTime);
+
+    // Send the command to SSC-32U
+    sscSerial.print(command);
+
+    // Debug: Print the command to the Serial Monitor
+    Serial.print("Command Sent to SSC-32U: ");
+    Serial.println(command);
+}
+
+// Function to update LED status
+void updateLEDStatus(bool isMoving) {
+    if (isMoving) {
+        digitalWrite(ledPin, HIGH); // Turn ON LED if moving
+    } else {
+        digitalWrite(ledPin, LOW);  // Turn OFF LED if idle
+    }
+}
+// Function to check emergency stop
+void checkEmergencyStop() {
+    if (digitalRead(emergency_stop_pin) == LOW) {
+        isEmergencyStop = true;
+        digitalWrite(ledPin, LOW); // Turn off LED during emergency stop
+        Serial.println("Emergency Stop Activated!");
+    }
+}
