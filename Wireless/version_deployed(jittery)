@@ -1,0 +1,157 @@
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+#include <Wire.h> 
+#include <Adafruit_PWMServoDriver.h> 
+
+// ====================================================================
+//                          1. HARDWARE CONFIGURATION
+// ====================================================================
+
+// --- 1.1 HUB MAC ADDRESS (For Status Reply) ---
+uint8_t HUB_MAC_ADDRESS[] = {0x30, 0xED, 0xA0, 0xBE, 0x4F, 0x8C}; 
+
+// --- 1.2 I2C PCA9685 Configuration ---
+// D2=SDA (GPIO 4), D1=SCL (GPIO 5) on NodeMCU
+const int I2C_SDA_PIN = D2;
+const int I2C_SCL_PIN = D1;
+const int PCA9685_ADDRESS = 0x40;
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDRESS);
+
+// --- 1.3 6-SERVO PCA9685 CHANNEL MAPPING (Matching Diagram) ---
+const int BASE_CH = 0;      // Control Index [0] -> Channel 0
+const int SHOULDER_CH = 1;  // Control Index [1] -> Channel 1
+const int ELBOW_CH = 2;     // Control Index [2] -> Channel 2
+const int WRIST_CH = 3;     // Control Index [3] -> Channel 3 (Wrist Pitch/Flex)
+const int GRIPPER_CH = 4;   // Control Index [5] -> Channel 4 (Gripper)
+const int WRIST_ROTATE_CH = 5; // Control Index [4] -> Channel 5 (Wrist Rotate, IK Assist)
+
+
+// ====================================================================
+//                          2. ESP-NOW STRUCTURES (6 SERVOS - SYNCHRONIZED)
+// ====================================================================
+
+// --- 2.1 Communication Structures (MUST MATCH ESP32-S3 HUB) ---
+typedef struct ControlMessage {
+    int motor_pulses[6]; // Expected Pulse Width: 500 to 2500 us
+    int recordCommand;
+} ControlMessage;
+ControlMessage receivedData; 
+
+typedef struct StatusMessage {
+    int status_code;
+    int current_positions[6];
+    int recording_steps;    
+} StatusMessage;
+StatusMessage outputStatus; 
+
+
+// ====================================================================
+//                          3. HELPER FUNCTIONS
+// ====================================================================
+
+int microsecToPwm(int microsec) {
+  microsec = constrain(microsec, 500, 2500);
+  return (int)((float)microsec * 4096.0f / 20000.0f);
+}
+
+void centerAllServos() {
+    int centerPulse = microsecToPwm(1500);
+    
+    pwm.setPWM(BASE_CH, 0, centerPulse);
+    pwm.setPWM(SHOULDER_CH, 0, centerPulse);
+    pwm.setPWM(ELBOW_CH, 0, centerPulse);
+    pwm.setPWM(WRIST_CH, 0, centerPulse);
+    pwm.setPWM(GRIPPER_CH, 0, centerPulse);
+    pwm.setPWM(WRIST_ROTATE_CH, 0, centerPulse);
+    
+    Serial.println("6 Servos centered (1500us) via PCA9685.");
+    delay(1000); 
+}
+
+
+// ====================================================================
+//                          4. ESP-NOW CALLBACKS
+// ====================================================================
+
+void OnDataRecv(uint8_t * mac, uint8_t *incomingDataPtr, uint8_t len) {
+    memcpy(&receivedData, incomingDataPtr, sizeof(receivedData));
+
+    // 1. Execute any momentary commands
+    if (receivedData.recordCommand != 0) {
+        Serial.printf("COMMAND RECEIVED: %d\n", receivedData.recordCommand);
+    }
+    
+    // 2. Apply all 6 motor pulses directly via the PCA9685
+    
+    // Index [0] Base -> Ch 0
+    pwm.setPWM(BASE_CH, 0, microsecToPwm(receivedData.motor_pulses[0]));
+    
+    // Index [1] Shoulder -> Ch 1
+    pwm.setPWM(SHOULDER_CH, 0, microsecToPwm(receivedData.motor_pulses[1]));
+    
+    // Index [2] Elbow -> Ch 2
+    pwm.setPWM(ELBOW_CH, 0, microsecToPwm(receivedData.motor_pulses[2]));
+    
+    // Index [3] Wrist -> Ch 3 (Controlled by J2-Y)
+    pwm.setPWM(WRIST_CH, 0, microsecToPwm(receivedData.motor_pulses[3]));
+    
+    // Index [4] Wrist Rotate -> Ch 5 (Controlled by IK Assist)
+    pwm.setPWM(WRIST_ROTATE_CH, 0, microsecToPwm(receivedData.motor_pulses[4]));
+
+    // Index [5] Gripper -> Ch 4 (Controlled by Buttons)
+    pwm.setPWM(GRIPPER_CH, 0, microsecToPwm(receivedData.motor_pulses[5]));
+    
+    // 3. Update status data
+    for (int i = 0; i < 6; i++) {
+        outputStatus.current_positions[i] = receivedData.motor_pulses[i];
+    }
+    
+    // 4. Send the status back to the ESP32-S3 Hub 
+    esp_now_send(HUB_MAC_ADDRESS, (uint8_t *) &outputStatus, sizeof(outputStatus));
+}
+
+
+// ====================================================================
+//                          5. SETUP AND LOOP
+// ====================================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000); 
+
+    Serial.print("NodeMCU MAC Address: ");
+    Serial.println(WiFi.macAddress());
+    
+    // --- 5.1 Initialize I2C Bus ---
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); 
+    
+    // --- 5.2 Initialize PCA9685 Servo Driver ---
+    pwm.begin();
+    pwm.setPWMFreq(50); // 50 Hz for standard servos
+    
+    // --- 5.3 SAFETY CHECK: Center Servos ---
+    centerAllServos();
+    
+    // --- 5.4 Initialize ESP-NOW ---
+    WiFi.mode(WIFI_STA);
+    if (esp_now_init() != 0) {
+        Serial.println("Error initializing ESP-NOW");
+        outputStatus.status_code = 1; 
+        return;
+    }
+    
+    // Register the receive callback function
+    esp_now_set_self_role(ESPNOW_ROLE_COMBO);
+    esp_now_register_recv_cb(OnDataRecv);
+
+    // --- 5.5 Register Hub Peer (for Status Return) ---
+    esp_now_add_peer(HUB_MAC_ADDRESS, ESPNOW_ROLE_COMBO, 0, NULL, 0);
+
+    Serial.println("Robot Controller Ready.");
+    outputStatus.status_code = 0; // Ready
+}
+
+void loop() {
+    delay(10); 
+}
