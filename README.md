@@ -69,6 +69,7 @@ The control system is distributed across two custom firmware modules:
 ## ⚠️ Risk & Safety
 * **Operational Reach:** The robot now extends to **50cm**. Ensure the workspace is clear before engagement to avoid property damage.
 * **Software Interlock:** Motors are mathematically locked until the "Drift Check" passes.
+* **Upgraded to PCA9685:** Replaced the default motor driver given, intragrating our owm with the pca9685.
 
 ---
 *Note: This project is a student submission for academic assessment.*
